@@ -18,8 +18,6 @@ interface SSRContext {
 
 type SSRModule = Record<string, any>
 
-const pendingModules = new Map<string, Promise<SSRModule>>()
-
 export async function ssrLoadModule(
   url: string,
   server: ViteDevServer,
@@ -28,40 +26,21 @@ export async function ssrLoadModule(
 ): Promise<SSRModule> {
   url = unwrapId(url)
 
-  if (urlStack.includes(url)) {
-    server.config.logger.warn(
-      `Circular dependency: ${urlStack.join(' -> ')} -> ${url}`
-    )
-    return {}
-  }
-
-  // when we instantiate multiple dependency modules in parallel, they may
-  // point to shared modules. We need to avoid duplicate instantiation attempts
-  // by register every module as pending synchronously so that all subsequent
-  // request to that module are simply waiting on the same promise.
-  const pending = pendingModules.get(url)
-  if (pending) {
-    return pending
-  }
-
-  const modulePromise = instantiateModule(url, server, context, urlStack)
-  pendingModules.set(url, modulePromise)
-  modulePromise.catch(() => {}).then(() => pendingModules.delete(url))
-  return modulePromise
-}
-
-async function instantiateModule(
-  url: string,
-  server: ViteDevServer,
-  context: SSRContext = { global },
-  urlStack: string[] = []
-): Promise<SSRModule> {
   const { moduleGraph } = server
   const mod = await moduleGraph.ensureEntryFromUrl(url)
 
-  if (mod.ssrModule) {
-    return mod.ssrModule
+  // Detect cycles and then return with exports object
+  // before it is populated
+  if (urlStack.includes(url)) return mod.ssrModule!
+
+  if (mod.ssrModule) return mod.ssrModule
+
+  const ssrModule = {
+    [Symbol.toStringTag]: 'Module'
   }
+  Object.defineProperty(ssrModule, '__esModule', { value: true })
+
+  mod.ssrModule = ssrModule
 
   const result =
     mod.ssrTransformResult ||
@@ -71,20 +50,16 @@ async function instantiateModule(
     throw new Error(`failed to load module for ssr: ${url}`)
   }
 
-  const ssrModule = {
-    [Symbol.toStringTag]: 'Module'
-  }
-  Object.defineProperty(ssrModule, '__esModule', { value: true })
-
   const isExternal = (dep: string) => dep[0] !== '.' && dep[0] !== '/'
 
-  await Promise.all(
-    result.deps!.map((dep) => {
-      if (!isExternal(dep)) {
-        return ssrLoadModule(dep, server, context, urlStack.concat(url))
-      }
-    })
-  )
+  // Load things sequentially depth-first to avoid having multiple
+  // branches attempt to load the same module, which can lead to
+  // havok and mayhem for circular modules
+  for (let dep of result.deps!) {
+    if (!isExternal(dep)) {
+      await ssrLoadModule(dep, server, context, urlStack.concat(url))
+    }
+  }
 
   const ssrImportMeta = { url }
 
@@ -147,7 +122,7 @@ async function instantiateModule(
     throw e
   }
 
-  mod.ssrModule = Object.freeze(ssrModule)
+  Object.freeze(ssrModule)
   return ssrModule
 }
 
