@@ -17,6 +17,7 @@ interface SSRContext {
 }
 
 type SSRModule = Record<string, any>
+const pendingModules = new Map<string, Promise<SSRModule>>()
 
 export async function ssrLoadModule(
   url: string,
@@ -33,7 +34,26 @@ export async function ssrLoadModule(
   // before it is populated
   if (urlStack.includes(url)) return mod.ssrModule!
 
-  if (mod.ssrModule) return mod.ssrModule
+  const pending = pendingModules.get(url)
+  if (pending) return pending
+  const modulePromise = instantiateModule(url, server, context, urlStack)
+  pendingModules.set(url, modulePromise)
+  modulePromise.catch(() => {}).then(() => pendingModules.delete(url))
+  return modulePromise
+}
+
+export async function instantiateModule(
+  url: string,
+  server: ViteDevServer,
+  context: SSRContext = { global },
+  urlStack: string[] = []
+): Promise<SSRModule> {
+  const { moduleGraph } = server
+  const mod = await moduleGraph.ensureEntryFromUrl(url)
+
+  if (mod.ssrModule && Object.isFrozen(mod.ssrModule)) {
+    return mod.ssrModule
+  }
 
   const ssrModule = {
     [Symbol.toStringTag]: 'Module'
